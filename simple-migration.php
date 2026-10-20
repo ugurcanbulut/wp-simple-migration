@@ -2,13 +2,18 @@
 /**
  * Plugin Name: Simple Migration
  * Description: Send selected posts (with author, terms, meta and attachments) to another site running this plugin.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Requires PHP: 8.0
  */
 
 defined( 'ABSPATH' ) || exit;
 
-const SM_SKIP_META = [ '_edit_lock', '_edit_last', '_sm_source', '_elementor_css', '_elementor_element_cache', '_sm_sent' ];
+const SM_VERSION   = '1.1.0';
+const SM_SKIP_META = [
+	'_edit_lock', '_edit_last', '_elementor_css', '_elementor_element_cache',
+	'_pingme', '_encloseme', // would make the receiver ping/fetch external sites
+	'_sm_source', '_sm_source_modified', '_sm_sent',
+];
 
 register_activation_hook( __FILE__, function () {
 	add_option( 'sm_key', wp_generate_password( 32, false ) );
@@ -24,254 +29,157 @@ add_action( 'admin_init', function () {
 	register_setting( 'simple-migration', 'sm_key', [ 'sanitize_callback' => 'sanitize_text_field' ] );
 } );
 
+add_action( 'admin_enqueue_scripts', function ( $hook ) {
+	if ( 'tools_page_simple-migration' !== $hook ) {
+		return;
+	}
+	$assets = plugin_dir_url( __FILE__ ) . 'assets/';
+	wp_enqueue_style( 'simple-migration', $assets . 'admin.css', [ 'dashicons' ], SM_VERSION );
+	wp_enqueue_script( 'simple-migration', $assets . 'admin.js', [], SM_VERSION, true );
+	wp_add_inline_script( 'simple-migration', 'window.smConfig = ' . wp_json_encode( [
+		'ajax'  => admin_url( 'admin-ajax.php' ),
+		'nonce' => wp_create_nonce( 'sm' ),
+		'home'  => home_url(),
+		'url'   => get_option( 'sm_target_url' ),
+		'key'   => get_option( 'sm_target_key' ),
+	] ) . ';', 'before' );
+} );
+
 function sm_post_types(): array {
 	return array_filter( get_post_types( [ 'show_ui' => true ], 'objects' ), fn( $t ) => 'attachment' !== $t->name && ! preg_match( '/^(wp_|acf-)/', $t->name ) );
 }
 
 function sm_page() {
+	$host = wp_parse_url( home_url(), PHP_URL_HOST );
 	?>
-	<div class="wrap" id="sm">
-		<h1>Simple Migration</h1>
-		<style>
-			#sm [hidden] { display: none !important; } /* .button sets display, which beats [hidden] */
-			#sm-rows tr { cursor: pointer; }
-			#sm-log { max-height: 320px; overflow: auto; }
-			#sm-log .sm-fail { color: #d63638; }
-			#sm-log .sm-warn { color: #996800; }
-			#sm-progress progress { width: 100%; max-width: 640px; height: 20px; vertical-align: middle; }
-			.sm-ok { color: #008a20; } .sm-err { color: #d63638; }
-			.sm-badge { margin-left: 6px; padding: 1px 6px; border-radius: 3px; background: #f0f0f1; color: #50575e; font-size: 11px; }
-		</style>
-
-		<h2>1. Connect to the receiver site</h2>
-		<p>Install Simple Migration on the other site and copy the key from its <em>Tools → Simple Migration</em> page.</p>
-		<table class="form-table" role="presentation">
-			<tr>
-				<th><label for="sm-url">Receiver URL</label></th>
-				<td><input id="sm-url" type="url" class="regular-text" placeholder="https://example.com" value="<?php echo esc_attr( get_option( 'sm_target_url' ) ); ?>"></td>
-			</tr>
-			<tr>
-				<th><label for="sm-target-key">Receiver key</label></th>
-				<td>
-					<input id="sm-target-key" class="regular-text code" autocomplete="off" value="<?php echo esc_attr( get_option( 'sm_target_key' ) ); ?>">
-					<button type="button" class="button" id="sm-connect">Connect</button>
-					<p id="sm-status" aria-live="polite"></p>
-				</td>
-			</tr>
-		</table>
-
-		<h2>2. Pick posts</h2>
-		<div class="tablenav top">
-			<div class="alignleft actions">
-				<label class="screen-reader-text" for="sm-type">Post type</label>
-				<select id="sm-type">
-					<?php foreach ( sm_post_types() as $t ) : ?>
-						<option value="<?php echo esc_attr( $t->name ); ?>"><?php echo esc_html( $t->labels->name ); ?></option>
-					<?php endforeach; ?>
-				</select>
-				<label class="screen-reader-text" for="sm-search">Search</label>
-				<input type="search" id="sm-search" placeholder="Search…">
+	<div class="wrap sm">
+		<header class="sm-header">
+			<div>
+				<h1 class="sm-title">Simple Migration</h1>
+				<p class="sm-subtitle">Send posts from <strong><?php echo esc_html( $host ); ?></strong> to another WordPress site.</p>
 			</div>
-			<div class="tablenav-pages">
-				<span class="displaying-num" id="sm-total"></span>
-				<button type="button" class="button" id="sm-prev" aria-label="Previous page">‹</button>
-				<span id="sm-pageinfo"></span>
-				<button type="button" class="button" id="sm-next" aria-label="Next page">›</button>
-			</div>
+			<div class="sm-connection" id="sm-connection" aria-live="polite"></div>
+		</header>
+		<hr class="wp-header-end">
+
+		<section class="sm-card sm-connect" id="sm-connect-card" aria-labelledby="sm-connect-title">
+			<h2 id="sm-connect-title" class="sm-card-title">Connect a receiving site</h2>
+			<form class="sm-connect-form" id="sm-connect-form">
+				<p class="sm-field">
+					<label for="sm-url">Site URL</label>
+					<input id="sm-url" type="url" placeholder="https://example.com" required>
+				</p>
+				<p class="sm-field">
+					<label for="sm-target-key">Key</label>
+					<input id="sm-target-key" class="code" autocomplete="off" spellcheck="false" required>
+				</p>
+				<p class="sm-field sm-field--action">
+					<button type="submit" class="button button-primary" id="sm-connect">Connect</button>
+					<button type="button" class="button" id="sm-connect-cancel" hidden>Cancel</button>
+				</p>
+			</form>
+			<p class="sm-help">Install Simple Migration on the receiving site and copy the key from its <em>Tools → Simple Migration</em> page.</p>
+			<p class="sm-notice sm-notice--error" id="sm-connect-error" role="alert" hidden></p>
+		</section>
+
+		<details class="sm-card sm-health" id="sm-health" hidden>
+			<summary>
+				<span class="sm-card-title">Health check</span>
+				<span class="sm-health-summary" id="sm-health-summary"></span>
+			</summary>
+			<table class="sm-health-table">
+				<thead><tr><th scope="col">Check</th><th scope="col">This site</th><th scope="col">Receiver</th></tr></thead>
+				<tbody id="sm-health-rows"></tbody>
+			</table>
+			<p class="sm-help">During a migration, Simple Migration raises memory to 1&nbsp;GB, lifts the time limit and turns on WordPress import mode on the receiver. This applies to its own requests only: nothing in <code>wp-config.php</code> or <code>php.ini</code> is changed. Values above already include it.</p>
+		</details>
+
+		<div class="sm-toolbar">
+			<label for="sm-type">Post type</label>
+			<select id="sm-type">
+				<?php foreach ( sm_post_types() as $t ) : ?>
+					<option value="<?php echo esc_attr( $t->name ); ?>"><?php echo esc_html( $t->labels->name ); ?></option>
+				<?php endforeach; ?>
+			</select>
+			<button type="button" class="button sm-icon-button" id="sm-refresh"><span class="dashicons dashicons-update" aria-hidden="true"></span>Refresh</button>
 		</div>
-		<table class="wp-list-table widefat fixed striped">
-			<thead>
-				<tr>
-					<td class="manage-column check-column"><input type="checkbox" id="sm-all" aria-label="Select all on this page"></td>
-					<th>Title</th><th>Status</th><th>Author</th><th>Date</th><th>Last sent here</th>
-				</tr>
-			</thead>
-			<tbody id="sm-rows"></tbody>
-		</table>
-		<p>
-			<strong id="sm-count">0 selected</strong> ·
-			<button type="button" class="button-link" id="sm-select-matching">Select all matching</button> ·
-			<button type="button" class="button-link" id="sm-clear">Clear selection</button>
-		</p>
 
-		<h2>3. Send</h2>
-		<p>
-			<label><input type="checkbox" id="sm-flatten"> Convert Elementor posts to standard WordPress content</label><br>
-			<span class="description">Elementor layouts are sent as plain content (headings, text, images, links) and Elementor data is dropped, so the receiver doesn't need Elementor. Design and styling are not kept. Posts marked <em>Elementor</em> above are affected.</span>
-		</p>
-		<p>
-			<button type="button" class="button button-primary button-hero" id="sm-send" disabled>Send selected posts</button>
-			<button type="button" class="button" id="sm-stop" hidden>Stop after current post</button>
-		</p>
-		<p id="sm-progress" hidden><progress max="1" value="0"></progress> <span id="sm-progress-text"></span></p>
-		<ol id="sm-log"></ol>
+		<div class="sm-panes">
+			<section class="sm-card sm-pane" aria-labelledby="sm-source-title">
+				<header class="sm-pane-head">
+					<h2 class="sm-card-title" id="sm-source-title">This site</h2>
+					<span class="sm-host"><?php echo esc_html( $host ); ?></span>
+				</header>
+				<div class="sm-filters" id="sm-source-filters" role="group" aria-label="Filter this site’s posts"></div>
+				<label class="screen-reader-text" for="sm-source-search">Search this site’s posts</label>
+				<input type="search" class="sm-search" id="sm-source-search" placeholder="Search by title, slug or ID">
+				<table class="sm-list">
+					<thead><tr>
+						<td class="sm-col-check"><input type="checkbox" id="sm-all" aria-label="Select all shown posts"></td>
+						<th scope="col">Post</th>
+						<th scope="col" class="sm-col-state">On receiver</th>
+					</tr></thead>
+					<tbody id="sm-source-rows"></tbody>
+				</table>
+				<nav class="sm-pager" id="sm-source-pager" aria-label="This site’s posts pages"></nav>
+			</section>
 
-		<hr>
-		<h2>Receiving posts on this site</h2>
-		<form method="post" action="options.php">
-			<?php settings_fields( 'simple-migration' ); ?>
-			<p>
-				<label for="sm_key">This site's key</label><br>
-				<input id="sm_key" name="sm_key" class="regular-text code" value="<?php echo esc_attr( get_option( 'sm_key' ) ); ?>">
+			<section class="sm-card sm-pane" aria-labelledby="sm-target-title">
+				<header class="sm-pane-head">
+					<h2 class="sm-card-title" id="sm-target-title">Receiver</h2>
+					<span class="sm-host" id="sm-target-host">Not connected</span>
+				</header>
+				<div class="sm-filters" id="sm-target-filters" role="group" aria-label="Filter the receiver’s posts"></div>
+				<label class="screen-reader-text" for="sm-target-search">Search the receiver’s posts</label>
+				<input type="search" class="sm-search" id="sm-target-search" placeholder="Search by title, slug or ID">
+				<table class="sm-list">
+					<thead><tr>
+						<th scope="col">Post</th>
+						<th scope="col" class="sm-col-state">Origin</th>
+						<td class="sm-col-action"></td>
+					</tr></thead>
+					<tbody id="sm-target-rows"></tbody>
+				</table>
+				<nav class="sm-pager" id="sm-target-pager" aria-label="Receiver’s posts pages"></nav>
+			</section>
+		</div>
+
+		<div class="sm-actionbar" id="sm-actionbar">
+			<div class="sm-selection">
+				<strong id="sm-count">No posts selected</strong>
+				<button type="button" class="button-link" id="sm-select-filter"></button>
+				<button type="button" class="button-link" id="sm-clear" hidden>Clear</button>
+			</div>
+			<label class="sm-switch" title="Elementor layouts are sent as plain content (headings, text, images, links). Design and styling are not kept, and the receiver doesn’t need Elementor.">
+				<input type="checkbox" id="sm-flatten">
+				<span>Convert Elementor to standard content</span>
+			</label>
+			<div class="sm-progress" id="sm-progress" hidden>
+				<progress id="sm-bar" max="1" value="0"></progress>
+				<span id="sm-progress-text" aria-live="polite"></span>
+			</div>
+			<button type="button" class="button" id="sm-stop" hidden>Stop after this post</button>
+			<button type="button" class="button button-primary" id="sm-send" disabled>Send</button>
+		</div>
+
+		<section class="sm-card sm-activity" id="sm-activity" aria-labelledby="sm-activity-title" hidden>
+			<h2 class="sm-card-title" id="sm-activity-title">Activity</h2>
+			<ol class="sm-log" id="sm-log"></ol>
+		</section>
+
+		<details class="sm-card sm-receive">
+			<summary><span class="sm-card-title">Receiving posts on this site</span></summary>
+			<form method="post" action="options.php" class="sm-receive-form">
+				<?php settings_fields( 'simple-migration' ); ?>
+				<p class="sm-field">
+					<label for="sm_key">This site’s key</label>
+					<input id="sm_key" name="sm_key" class="code" value="<?php echo esc_attr( get_option( 'sm_key' ) ); ?>" autocomplete="off" spellcheck="false">
+				</p>
 				<?php submit_button( 'Save key', 'secondary', 'submit', false ); ?>
-			</p>
-			<p class="description">Paste this into the sending site. Anyone with it can add posts and users here. Clear it to stop receiving.</p>
-		</form>
+			</form>
+			<p class="sm-help">Paste this key into the sending site. Whoever has it can add posts and users here, so keep it private. Clear it to stop receiving.</p>
+		</details>
 	</div>
-	<script>
-	( () => {
-		const $ = ( id ) => document.getElementById( id );
-		const nonce = <?php echo wp_json_encode( wp_create_nonce( 'sm' ) ); ?>;
-		const selected = new Set();
-		const titles = new Map(); // id → title, for log lines when a post fails before its title is known
-		let page = 1, pages = 1, connected = false, stop = false, sending = false, debounce;
-
-		const call = ( action, data = {} ) => {
-			const body = new FormData();
-			body.append( 'action', action );
-			body.append( '_ajax_nonce', nonce );
-			Object.entries( data ).forEach( ( [ k, v ] ) => body.append( k, v ) );
-			return fetch( ajaxurl, { method: 'POST', body, credentials: 'same-origin' } )
-				.then( async ( r ) => {
-					const text = await r.text();
-					try {
-						return JSON.parse( text );
-					} catch {
-						const detail = text.replace( /<[^>]*>/g, ' ' ).replace( /\s+/g, ' ' ).trim().slice( 0, 300 );
-						return { success: false, data: `No valid reply from this site (HTTP ${ r.status }): ${ detail || 'empty response, probably a server timeout' }` };
-					}
-				} )
-				.catch( ( e ) => ( { success: false, data: 'Request failed: ' + e.message } ) );
-		};
-		const status = ( ok, msg ) => { $( 'sm-status' ).className = ok ? 'sm-ok' : 'sm-err'; $( 'sm-status' ).textContent = msg; };
-		const refresh = () => {
-			const n = selected.size;
-			$( 'sm-count' ).textContent = n + ' selected';
-			$( 'sm-send' ).disabled = sending || ! connected || ! n;
-			$( 'sm-send' ).textContent = n ? `Send ${ n } post${ n > 1 ? 's' : '' }` : 'Send selected posts';
-			const boxes = [ ...$( 'sm-rows' ).querySelectorAll( 'input' ) ];
-			$( 'sm-all' ).checked = boxes.length > 0 && boxes.every( ( b ) => b.checked );
-		};
-		const filters = () => ( { type: $( 'sm-type' ).value, s: $( 'sm-search' ).value } );
-
-		async function connect() {
-			connected = false;
-			status( true, 'Checking connection…' );
-			refresh();
-			const r = await call( 'sm_connect', { url: $( 'sm-url' ).value, key: $( 'sm-target-key' ).value } );
-			connected = r.success;
-			status( r.success, r.success ? `✓ Connected to “${ r.data.name }” (${ r.data.url }). Max request size there: ${ r.data.limit }.` : '✗ ' + r.data );
-			load();
-		}
-
-		function row( p ) {
-			const tr = document.createElement( 'tr' );
-			titles.set( p.id, p.title );
-			const th = Object.assign( document.createElement( 'th' ), { className: 'check-column', scope: 'row' } );
-			const cb = Object.assign( document.createElement( 'input' ), { type: 'checkbox', value: p.id, checked: selected.has( p.id ) } );
-			cb.setAttribute( 'aria-label', 'Select ' + p.title );
-			cb.onchange = () => { cb.checked ? selected.add( p.id ) : selected.delete( p.id ); refresh(); };
-			th.append( cb );
-			tr.append( th, ...[ p.title, p.status, p.author, p.date, p.sent ].map( ( t ) => Object.assign( document.createElement( 'td' ), { textContent: t } ) ) );
-			if ( p.builder ) { tr.children[ 1 ].append( Object.assign( document.createElement( 'span' ), { className: 'sm-badge', textContent: 'Elementor' } ) ); }
-			tr.onclick = ( e ) => { if ( e.target !== cb ) { cb.click(); } };
-			return tr;
-		}
-
-		async function load() {
-			const r = await call( 'sm_posts', { ...filters(), page } );
-			if ( ! r.success ) { return; }
-			pages = Math.max( 1, r.data.pages );
-			$( 'sm-rows' ).replaceChildren( ...r.data.rows.map( row ) );
-			if ( ! r.data.rows.length ) { $( 'sm-rows' ).innerHTML = '<tr><td colspan="6">No posts found.</td></tr>'; }
-			$( 'sm-total' ).textContent = r.data.total + ' items';
-			$( 'sm-pageinfo' ).textContent = `${ page } of ${ pages }`;
-			$( 'sm-prev' ).disabled = page <= 1;
-			$( 'sm-next' ).disabled = page >= pages;
-			$( 'sm-select-matching' ).textContent = `Select all ${ r.data.total } matching`;
-			refresh();
-		}
-
-		$( 'sm-connect' ).onclick = connect;
-		$( 'sm-type' ).onchange = () => { page = 1; load(); };
-		$( 'sm-search' ).oninput = () => { clearTimeout( debounce ); debounce = setTimeout( () => { page = 1; load(); }, 300 ); };
-		$( 'sm-prev' ).onclick = () => { page--; load(); };
-		$( 'sm-next' ).onclick = () => { page++; load(); };
-		$( 'sm-all' ).onchange = () => {
-			const on = $( 'sm-all' ).checked;
-			$( 'sm-rows' ).querySelectorAll( 'input' ).forEach( ( b ) => {
-				b.checked = on;
-				on ? selected.add( +b.value ) : selected.delete( +b.value );
-			} );
-			refresh();
-		};
-		$( 'sm-clear' ).onclick = () => { selected.clear(); load(); };
-		$( 'sm-select-matching' ).onclick = async () => {
-			const r = await call( 'sm_posts', { ...filters(), ids: 1 } );
-			if ( r.success ) { r.data.forEach( ( id ) => selected.add( id ) ); load(); }
-		};
-		$( 'sm-stop' ).onclick = () => { stop = true; $( 'sm-stop' ).disabled = true; };
-		window.addEventListener( 'beforeunload', ( e ) => { if ( sending ) { e.preventDefault(); } } );
-
-		$( 'sm-send' ).onclick = async () => {
-			const ids = [ ...selected ];
-			let ok = 0, fail = 0;
-			sending = true; stop = false;
-			$( 'sm-stop' ).hidden = false; $( 'sm-stop' ).disabled = false;
-			$( 'sm-progress' ).hidden = false;
-			$( 'sm-log' ).replaceChildren();
-			refresh();
-			const flatten = $( 'sm-flatten' ).checked ? 1 : '';
-			const bar = $( 'sm-progress' ).querySelector( 'progress' );
-			for ( const [ i, id ] of ids.entries() ) {
-				if ( stop ) { break; }
-				const li = document.createElement( 'li' );
-				$( 'sm-log' ).append( li );
-				let title = titles.get( id ) || '#' + id, error = null, warnings = [], result;
-				const step = ( label, done ) => {
-					li.textContent = `… ${ title }: ${ label }`;
-					$( 'sm-progress-text' ).textContent = `Post ${ i + 1 } of ${ ids.length }: ${ title } (${ label })`;
-					bar.value = ( i + done ) / ids.length;
-				};
-
-				step( 'preparing', 0 );
-				const plan = await call( 'sm_plan', { id, flatten } );
-				if ( plan.success ) {
-					title = plan.data.title;
-					const files = plan.data.files;
-					for ( const [ j, f ] of files.entries() ) {
-						step( `file ${ j + 1 } of ${ files.length }`, ( j + 1 ) / ( files.length + 2 ) );
-						const r = await call( 'sm_send_file', { id: f.id } );
-						if ( ! r.success ) { warnings.push( `${ f.name } not sent: ${ r.data }` ); }
-					}
-					step( 'post', ( files.length + 1 ) / ( files.length + 2 ) );
-					result = await call( 'sm_send', { id, flatten } );
-					result.success ? warnings.push( ...result.data.warnings ) : ( error = result.data );
-				} else {
-					error = plan.data;
-				}
-
-				if ( error ) {
-					fail++;
-					li.className = 'sm-fail';
-					li.textContent = `✗ ${ title }: ${ error }`;
-				} else {
-					ok++;
-					selected.delete( id );
-					li.replaceChildren( '✓ ' + title + ' — ', Object.assign( document.createElement( 'a' ), { href: result.data.edit, target: '_blank', textContent: 'edit on receiver' } ) );
-					if ( warnings.length ) { li.className = 'sm-warn'; li.append( ' — ' + warnings.join( '; ' ) ); }
-				}
-				bar.value = ( i + 1 ) / ids.length;
-			}
-			$( 'sm-progress-text' ).textContent = `${ stop ? 'Stopped' : 'Done' }: ${ ok } sent, ${ fail } failed.` + ( fail ? ' Failed posts stay selected, so you can retry.' : '' );
-			sending = false;
-			$( 'sm-stop' ).hidden = true;
-			load();
-		};
-
-		$( 'sm-url' ).value && $( 'sm-target-key' ).value ? connect() : load();
-	} )();
-	</script>
 	<?php
 }
 
@@ -299,6 +207,68 @@ function sm_elementor_refs( $data, callable $cb ) {
 		}
 	}
 	return $data;
+}
+
+/* ---------- Shared: limits, environment report, post lists ---------- */
+
+// Raised for Simple Migration's own requests only, so it's temporary by construction: nothing in
+// wp-config.php, php.ini or .htaccess changes. Hosts that lock limits (php_admin_value) keep theirs,
+// and the health check shows the effective values.
+function sm_boost(): void {
+	add_filter( 'simple_migration_memory_limit', fn() => '1024M', 0 ); // later filters can change it
+	wp_raise_memory_limit( 'simple_migration' );
+	set_time_limit( 0 );
+}
+
+function sm_env(): array {
+	sm_boost();
+	$editor = _wp_image_editor_choose( [ 'mime_type' => 'image/jpeg', 'methods' => [ 'resize' ] ] );
+	return [
+		'name'     => get_bloginfo( 'name' ),
+		'url'      => home_url(),
+		'admin'    => admin_url(),
+		'version'  => SM_VERSION,
+		'wp'       => get_bloginfo( 'version' ),
+		'php'      => PHP_VERSION,
+		'memory'   => ini_get( 'memory_limit' ),
+		'time'     => ini_get( 'max_execution_time' ),
+		'post_max' => ini_get( 'post_max_size' ),
+		'editor'   => $editor ? str_replace( 'WP_Image_Editor_', '', $editor ) : 'none',
+	];
+}
+
+// ponytail: whole list in one response (a few hundred bytes per post); page it server-side past ~20k posts.
+function sm_list_posts( string $type ): array {
+	global $wpdb;
+	$rows = $wpdb->get_results( $wpdb->prepare(
+		"SELECT p.ID, p.post_title, p.post_name, p.post_status, p.post_date, p.post_modified_gmt, p.post_author,
+			MAX( CASE WHEN m.meta_key = '_sm_source' THEN m.meta_value END ) AS source,
+			MAX( CASE WHEN m.meta_key = '_sm_source_modified' THEN m.meta_value END ) AS source_modified,
+			MAX( CASE WHEN m.meta_key = '_elementor_edit_mode' THEN m.meta_value END ) AS builder
+		FROM $wpdb->posts p
+		LEFT JOIN $wpdb->postmeta m ON m.post_id = p.ID AND m.meta_key IN ( '_sm_source', '_sm_source_modified', '_elementor_edit_mode' )
+		WHERE p.post_type = %s AND p.post_status IN ( 'publish', 'future', 'draft', 'pending', 'private' )
+		GROUP BY p.ID ORDER BY p.post_date DESC",
+		$type
+	) );
+	$authors   = wp_list_pluck( get_users( [ 'include' => array_unique( wp_list_pluck( $rows, 'post_author' ) ) ?: [ 0 ], 'fields' => [ 'ID', 'display_name' ] ] ), 'display_name', 'ID' );
+	$elementor = class_exists( '\Elementor\Plugin' );
+	$time      = fn( $gmt ) => $gmt && '0000-00-00 00:00:00' !== $gmt ? strtotime( "$gmt UTC" ) : 0;
+	return [
+		'type_exists' => post_type_exists( $type ),
+		'posts'       => array_map( fn( $r ) => [
+			'id'              => (int) $r->ID,
+			'title'           => html_entity_decode( $r->post_title ) ?: '(no title)',
+			'slug'            => urldecode( $r->post_name ),
+			'status'          => get_post_status_object( $r->post_status )->label ?? $r->post_status,
+			'date'            => mysql2date( get_option( 'date_format' ), $r->post_date ),
+			'modified'        => $time( $r->post_modified_gmt ),
+			'author'          => $authors[ $r->post_author ] ?? '',
+			'builder'         => $elementor && 'builder' === $r->builder,
+			'source'          => $r->source,
+			'source_modified' => $time( $r->source_modified ),
+		], $rows ),
+	];
 }
 
 /* ---------- Sender ---------- */
@@ -340,48 +310,27 @@ add_action( 'wp_ajax_sm_connect', function () {
 	if ( untrailingslashit( $r['url'] ) === untrailingslashit( home_url() ) ) {
 		wp_send_json_error( 'That URL is this site. Enter the other site’s URL.' );
 	}
-	wp_send_json_success( $r );
+	wp_send_json_success( [ 'sender' => sm_env(), 'receiver' => $r ] );
 } );
 
-add_action( 'wp_ajax_sm_posts', function () {
-	sm_ajax_guard();
+// Both sides' posts of one type, for the side-by-side view. Matching happens in the browser.
+add_action( 'wp_ajax_sm_lists', fn() => sm_ajax_step( function () {
 	$type = sanitize_key( $_POST['type'] ?? '' );
-	isset( sm_post_types()[ $type ] ) || wp_send_json_error( 'Unknown post type.' );
-	$args = [
-		'post_type'   => $type,
-		'post_status' => [ 'publish', 'future', 'draft', 'pending', 'private' ],
-		's'           => sanitize_text_field( wp_unslash( $_POST['s'] ?? '' ) ),
-		'orderby'     => 'date',
-		'order'       => 'DESC',
-	];
-	if ( ! empty( $_POST['ids'] ) ) {
-		wp_send_json_success( get_posts( $args + [ 'fields' => 'ids', 'posts_per_page' => -1 ] ) );
+	if ( ! isset( sm_post_types()[ $type ] ) ) {
+		return new WP_Error( 'sm', 'Unknown post type.' );
 	}
-	$q      = new WP_Query( $args + [ 'posts_per_page' => 20, 'paged' => max( 1, (int) ( $_POST['page'] ?? 1 ) ) ] );
-	$target = get_option( 'sm_target_url' );
-	wp_send_json_success( [
-		'total' => $q->found_posts,
-		'pages' => $q->max_num_pages,
-		'rows'  => array_map( function ( $p ) use ( $target ) {
-			$sent = ( get_post_meta( $p->ID, '_sm_sent', true ) ?: [] )[ $target ] ?? 0;
-			return [
-				'id'     => $p->ID,
-				'builder' => sm_is_elementor( $p->ID ),
-				'title'  => html_entity_decode( get_the_title( $p ) ?: '(no title)' ),
-				'status' => get_post_status_object( $p->post_status )->label,
-				'author' => get_the_author_meta( 'display_name', $p->post_author ),
-				'date'   => get_the_date( '', $p ),
-				'sent'   => $sent ? human_time_diff( $sent ) . ' ago' : '—',
-			];
-		}, $q->posts ),
-	] );
-} );
+	$receiver = get_option( 'sm_target_url' ) ? sm_remote( 'sm_list', [ 'type' => $type ] ) : null;
+	return [
+		'sender'   => sm_list_posts( $type ),
+		'receiver' => is_wp_error( $receiver ) ? [ 'error' => $receiver->get_error_message() ] : $receiver,
+	];
+} ) );
 
 // Runs one sender step and always answers JSON: stray output (e.g. PHP notices from widgets rendered
 // during Elementor conversion) is discarded, and errors become readable messages.
 function sm_ajax_step( callable $fn ): void {
 	sm_ajax_guard();
-	set_time_limit( 0 );
+	sm_boost();
 	add_filter( 'wp_php_error_message', fn( $msg, $e ) => "PHP fatal on this site: {$e['message']} in {$e['file']}:{$e['line']}", 10, 2 );
 	ob_start();
 	try {
@@ -406,15 +355,7 @@ add_action( 'wp_ajax_sm_plan', fn() => sm_ajax_step( function ( $id, $flatten ) 
 
 add_action( 'wp_ajax_sm_send_file', fn() => sm_ajax_step( fn( $id ) => sm_remote( 'sm_receive_media', sm_media_payload( $id ) ) ) );
 
-add_action( 'wp_ajax_sm_send', fn() => sm_ajax_step( function ( $id, $flatten ) {
-	$r = sm_remote( 'sm_receive', sm_export( $id, $flatten ) );
-	if ( ! is_wp_error( $r ) ) {
-		$sent = get_post_meta( $id, '_sm_sent', true ) ?: [];
-		$sent[ get_option( 'sm_target_url' ) ] = time();
-		update_post_meta( $id, '_sm_sent', $sent );
-	}
-	return $r;
-} ) );
+add_action( 'wp_ajax_sm_send', fn() => sm_ajax_step( fn( $id, $flatten ) => sm_remote( 'sm_receive', sm_export( $id, $flatten ) ) ) );
 
 function sm_media_payload( int $id ): array {
 	$a = sm_export_attachment( $id );
@@ -605,17 +546,26 @@ add_action( 'wp_ajax_nopriv_sm_receive', 'sm_ajax_receive' );
 add_action( 'wp_ajax_nopriv_sm_receive_media', 'sm_ajax_receive' );
 add_action( 'wp_ajax_sm_receive_media', 'sm_ajax_receive' );
 add_action( 'wp_ajax_sm_receive', 'sm_ajax_receive' );
+add_action( 'wp_ajax_nopriv_sm_list', 'sm_ajax_list' );
+add_action( 'wp_ajax_sm_list', 'sm_ajax_list' );
 
 function sm_ajax_ping() {
 	sm_receiver_auth();
-	wp_send_json_success( [ 'name' => get_bloginfo( 'name' ), 'url' => home_url(), 'limit' => ini_get( 'post_max_size' ) ] );
+	wp_send_json_success( sm_env() );
+}
+
+function sm_ajax_list() {
+	sm_receiver_auth();
+	$p = json_decode( file_get_contents( 'php://input' ), true );
+	wp_send_json_success( sm_list_posts( sanitize_key( $p['type'] ?? '' ) ) );
 }
 
 function sm_ajax_receive() {
 	sm_receiver_auth();
 	$p = json_decode( file_get_contents( 'php://input' ), true );
 	is_array( $p ) || wp_send_json_error( 'The post arrived empty, probably larger than the receiver’s post_max_size (' . ini_get( 'post_max_size' ) . ').', 413 );
-	set_time_limit( 0 );
+	sm_boost();
+	defined( 'WP_IMPORTING' ) || define( 'WP_IMPORTING', true ); // core and plugins skip pings, enclosures and similar extras
 	// Uncatchable fatals (memory, timeouts) go through WP's fatal handler: make it say what broke.
 	add_filter( 'wp_php_error_message', fn( $msg, $e ) => "PHP fatal on receiver: {$e['message']} in {$e['file']}:{$e['line']}", 10, 2 );
 	ob_start(); // PHP notices from other plugins' save hooks would corrupt the JSON reply
@@ -667,7 +617,7 @@ function sm_write_meta( string $type, int $id, array $meta, array $id_keys, call
 	global $wpdb;
 	$table = _get_meta_table( $type );
 	$col   = "{$type}_id";
-	$wpdb->query( $wpdb->prepare( "DELETE FROM $table WHERE $col = %d AND meta_key <> '_sm_source'", $id ) );
+	$wpdb->query( $wpdb->prepare( "DELETE FROM $table WHERE $col = %d AND meta_key NOT IN ( '_sm_source', '_sm_source_modified' )", $id ) );
 	foreach ( $meta as $k => $vals ) {
 		foreach ( $vals as $v ) {
 			$v = is_serialized( $v ) ? @unserialize( $v, [ 'allowed_classes' => false ] ) : $v;
@@ -794,6 +744,7 @@ function sm_import( array $p ) {
 	update_post_meta( $pid, '_sm_source', "$src|{$sp['ID']}" ); // set first, so a retry after a crash updates instead of duplicating
 
 	sm_write_meta( 'post', $pid, $p['meta'], $p['id_keys'], $cb, $rw );
+	update_post_meta( $pid, '_sm_source_modified', $sp['post_modified_gmt'] ); // lets the sender tell "changed since sent"
 
 	// Terms: create missing ones; update only terms an earlier migration created, never the receiver's own.
 	foreach ( $p['terms'] as $t ) {

@@ -105,9 +105,15 @@ try {
 	assert( $dst->post_title === $src->post_title && $dst->post_author === $src->post_author );
 	assert( ! str_contains( $dst->post_content, 'sender.example' ), 'content URLs rewritten' );
 	foreach ( get_post_meta( $new ) as $k => $vals ) {
-		assert( $k === '_sm_source' || ! str_contains( implode( $vals ), 'sender.example' ), "meta $k URLs rewritten" );
-		assert( $k === '_sm_source' || count( $vals ) === count( get_post_meta( $id, $k ) ), "meta $k count" );
+		assert( str_starts_with( $k, '_sm_source' ) || ! str_contains( implode( $vals ), 'sender.example' ), "meta $k URLs rewritten" );
+		assert( str_starts_with( $k, '_sm_source' ) || count( $vals ) === count( get_post_meta( $id, $k ) ), "meta $k count" );
 	}
+
+	// What the side-by-side view reads: the copy is listed with its source and the sender's modified time.
+	assert( get_post_meta( $new, '_sm_source_modified', true ) === $src->post_modified_gmt, 'sender modified time stored' );
+	$listed = array_column( sm_list_posts( $src->post_type )['posts'], null, 'id' )[ $new ];
+	assert( $listed['source'] === "$fake|$id" && $listed['source_modified'] === strtotime( "$src->post_modified_gmt UTC" ), 'copy listed with source' );
+	assert( ! metadata_exists( 'post', $new, '_pingme' ) && ! metadata_exists( 'post', $new, '_encloseme' ), 'no ping/enclosure markers copied' );
 
 	if ( $old_thumb = (int) get_post_thumbnail_id( $id ) ) {
 		$thumb = (int) get_post_meta( $new, '_thumbnail_id', true );

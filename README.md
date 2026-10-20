@@ -10,7 +10,7 @@ No export files, no SSH, no database dumps. Install the plugin on both sites, co
 [![Tested with WordPress 7.1](https://img.shields.io/badge/WordPress-tested%207.1-21759B?logo=wordpress&logoColor=white)](#-requirements)
 [![Elementor aware](https://img.shields.io/badge/Elementor-aware-92003B?logo=elementor&logoColor=white)](#-elementor-to-standard-content)
 [![ACF aware](https://img.shields.io/badge/ACF-aware-00E4BC)](#-what-gets-migrated)
-[![Single file](https://img.shields.io/badge/plugin-single%20file-555)](simple-migration.php)
+[![No build step](https://img.shields.io/badge/build-none-555)](#-development)
 
 [Features](#-features) · [Install](#-installation) · [Usage](#-usage) · [What migrates](#-what-gets-migrated) · [How it works](#-how-it-works) · [Troubleshooting](#-troubleshooting)
 
@@ -20,8 +20,11 @@ No export files, no SSH, no database dumps. Install the plugin on both sites, co
 
 ## ✨ Features
 
-- **Pick exactly what moves:** browse any post type, search, page through results and select across pages, or select every match in one click.
-- **Live progress:** sends one post at a time with a progress bar and a per-post log, including an "edit on receiver" link for each post that went through.
+- **Side-by-side view:** this site's posts next to the receiver's, with exact match indicators (**On receiver**, **Changed since sent**, **Not on receiver**, **Slug taken**). Hover a post to highlight its partner, or click its badge to jump to it.
+- **Sync in two clicks:** filter to **Changed since sent**, choose **Select all**, then send. Selection persists across filters and pages.
+- **Health check:** compares both sites' plugin version, memory, time limit, largest receivable file and image library, and flags anything that could make a migration fail.
+- **Temporary limits, no config edits:** memory is raised to 1 GB, the time limit is lifted and WordPress import mode is on, but only for Simple Migration's own requests. `wp-config.php` and `php.ini` stay untouched.
+- **Live progress:** sends one post at a time with a file-by-file progress bar and an activity log, including an "edit on receiver" link for each post that went through.
 - **Brings everything a post needs:** its author, categories and tags (with their custom fields), all custom fields, the featured image, gallery and content images, and files linked from anywhere in the post.
 - **Links keep working:** image URLs, attachment IDs (in blocks, ACF fields and Elementor data) and internal links are rewritten to the receiving site.
 - **Safe to re-send:** sending a post again updates its earlier copy instead of duplicating it, and that includes its images.
@@ -43,7 +46,7 @@ No export files, no SSH, no database dumps. Install the plugin on both sites, co
 1. Download the latest code as a ZIP (**Code → Download ZIP**), or build one yourself:
    ```bash
    git clone https://github.com/ugurcanbulut/wp-simple-migration.git simple-migration
-   zip -r simple-migration.zip simple-migration -x 'simple-migration/.git/*' 'simple-migration/tests/*'
+   zip -r simple-migration.zip simple-migration -x 'simple-migration/.git/*' 'simple-migration/tests/*' 'simple-migration/README.md'
    ```
 2. On **both** sites, go to **Plugins → Add New → Upload Plugin**, upload the ZIP and activate it.
 3. When updating an existing install, choose **Replace current with uploaded**.
@@ -56,9 +59,17 @@ Everything lives under **Tools → Simple Migration**.
 
 **On the sending site:**
 
-1. **Connect:** enter the receiver's URL and key, then click **Connect**. You'll see the receiver's site name and upload size limit, or the reason it couldn't connect.
-2. **Pick posts:** choose a post type, search, and click rows to select them. Posts built with Elementor are tagged, and **Last sent here** shows what has already been sent to this receiver.
-3. **Send:** optionally tick **Convert Elementor posts to standard WordPress content**, then click **Send**. Failed posts stay selected, so you can retry them with one click.
+1. **Connect:** enter the receiver's URL and key, then click **Connect**. The health check opens automatically if anything needs attention.
+2. **Compare and pick:** choose a post type. Your posts appear on the left and the receiver's on the right. Click rows to select them, or use a filter chip plus **Select all**.
+3. **Send:** optionally switch on **Convert Elementor to standard content**, then click **Send**. Failed posts stay selected and are marked **Failed**, so you can retry them with one click.
+
+| Badge | Meaning |
+|---|---|
+| ✅ **On receiver** | Sent, and unchanged here since |
+| ✏️ **Changed since sent** | Edited here after the last send; send again to update the copy |
+| ➖ **Not on receiver** | Never sent |
+| ⚠️ **Slug taken** | Not sent from here, but the receiver has a post with the same slug; sending creates a second post (`-2`) |
+| 🔗 **From this site** / 📍 **Receiver only** / ↪️ **From another site** | Where each receiver post came from |
 
 > [!TIP]
 > Send a single post first and check it on the receiver before sending a large batch.
@@ -109,6 +120,7 @@ sequenceDiagram
     S-->>B: ✓ edit link
 ```
 
+- **Comparing:** `sm_lists` returns both sites' posts of one type in one go. Each copy on the receiver records its origin (`_sm_source`) and the sender's last-modified time when it was sent (`_sm_source_modified`), so matching is exact rather than guessed from titles.
 - **Short steps:** each request moves at most one file, so memory stays small on both sites and no request runs into a server or proxy timeout.
 - **Copies are tracked:** every copy is tagged with the sender URL and original ID in a `_sm_source` field. That's how re-sends find and update the earlier copy.
 - **Authentication:** the receiver accepts requests only with its key in an `X-SM-Key` header, checked in constant time. An empty key disables receiving.
@@ -124,6 +136,8 @@ sequenceDiagram
 
 | Message | What it means / what to do |
 |---|---|
+| Health check: **Older than the other site** | Install the same Simple Migration version on both sites. |
+| Health check: **memory** warning | The host caps memory below what Simple Migration requests. Ask the host to allow more, or set `WP_MAX_MEMORY_LIMIT` if they permit it. |
 | `Wrong key` | Copy the key again from the receiver's Tools → Simple Migration page. |
 | `Receiving is turned off on that site` | The receiver's key is empty. Set one and save. |
 | `Could not reach the receiver: cURL error …` | Check the URL, DNS, firewall and SSL certificate. |
@@ -135,7 +149,7 @@ sequenceDiagram
 
 ## 🧪 Development
 
-The plugin is a single file: [`simple-migration.php`](simple-migration.php).
+No build step. [`simple-migration.php`](simple-migration.php) is the whole server side, and the admin UI is plain JavaScript and CSS in [`assets/`](assets), styled with WordPress admin's own color tokens so it follows the user's admin color scheme.
 
 [`tests/roundtrip.php`](tests/roundtrip.php) runs the full send flow inside one site, pretending the content came from another site. It covers content, fields, terms, authors, media remapping, re-sends, Elementor conversion and edited images. All database changes are rolled back and uploads go to a temp directory.
 
